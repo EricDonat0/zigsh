@@ -2,16 +2,75 @@
 const std = @import("std");
 const posix = std.posix.system;
 
+// Estrutura definida pelo professor.
+// Sera utilizada nas proximas etapas.
+const ParsedCommand = struct {
+    allocator: std.mem.Allocator,
+    args: std.ArrayList([]const u8) = .empty,
+
+    stdin_file: ?[]const u8 = null,
+    stdout_file: ?[]const u8 = null,
+    stderr_file: ?[]const u8 = null,
+    is_background: bool = false,
+
+    pub fn init(allocator: std.mem.Allocator) ParsedCommand {
+        return .{
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *ParsedCommand) void {
+        self.args.deinit(self.allocator);
+    }
+};
+
+// Assinatura Juicy Main - Zig 0.16.x
 pub fn main(init: std.process.Init) !void {
-    var buffer: [256]u8 = undefined;
-    var stdin = std.Io.File.stdin().reader(init.io, &buffer);
+    const allocator = init.gpa;
+
+    // Configuracao da entrada padrao
+    var input_buffer: [256]u8 = undefined;
+    var stdin = std.Io.File.stdin().reader(
+        init.io,
+        &input_buffer,
+    );
+
+    // Configuracao da saida padrao
+    var output_buffer: [1024]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(
+        init.io,
+        &output_buffer,
+    );
 
     while (true) {
-        std.debug.print("> ", .{});
 
-        const linha = (try stdin.interface.takeDelimiter('\n')) orelse break;
+        // TODO 1: Prompt dinamico com diretorio atual
+        const cwd = try std.process.currentPathAlloc(
+            init.io,
+            allocator,
+        );
+        defer allocator.free(cwd);
 
-        // Separa comando e argumentos
+        try stdout.interface.print(
+            "zigsh [{s}]> ",
+            .{cwd},
+        );
+        try stdout.interface.flush();
+
+        // TODO 2: Ler a linha e tratar EOF (Ctrl+D)
+        const linha = (try stdin.interface.takeDelimiter('\n')) orelse {
+            try stdout.interface.writeAll("\n");
+            try stdout.interface.flush();
+            break;
+        };
+
+        // Ignorar linhas vazias ou apenas com espacos
+        if (std.mem.trim(u8, linha, " \t\r").len == 0) {
+            continue;
+        }
+
+        // TODO 3: Parsing e tokenizacao completa
+        // Temporariamente, manter o parser original
         var tokens = std.mem.tokenizeAny(u8, linha, " \t\r");
 
         var args = [_]?[*:0]const u8{null} ** 9;
@@ -36,8 +95,14 @@ pub fn main(init: std.process.Init) !void {
 
         const comando = std.mem.span(args[0].?);
 
-        if (std.mem.eql(u8, comando, "exit")) break;
+        // TODO 4: Comandos internos
+        // Por enquanto, somente exit
+        if (std.mem.eql(u8, comando, "exit")) {
+            break;
+        }
 
+        // TODO 5: Executar comandos externos
+        // Temporariamente, usar fork + execve
         const pid = posix.fork();
 
         if (std.posix.errno(pid) != .SUCCESS) {
@@ -46,7 +111,7 @@ pub fn main(init: std.process.Init) !void {
         }
 
         if (pid == 0) {
-            // FILHO
+            // Processo filho
             var caminho_buffer: [256]u8 = undefined;
 
             const caminho = std.fmt.bufPrintSentinel(
@@ -64,14 +129,25 @@ pub fn main(init: std.process.Init) !void {
                 &env,
             );
 
-            std.debug.print("Comando nao encontrado!\n", .{});
+            std.debug.print(
+                "Comando nao encontrado!\n",
+                .{},
+            );
             posix.exit(127);
         } else {
-            // PAI
+            // TODO 8: Controle de concorrencia
+            // Temporariamente, aguardar o filho
             var status: u32 = 0;
             _ = posix.waitpid(@intCast(pid), &status, 0);
         }
+
+        // TODO 6: Redirecionamento de arquivos
+        // Implementar futuramente
+
+        // TODO 7: Pipelines
+        // Implementar futuramente
     }
 
-    std.debug.print("Shell encerrada.\n", .{});
+    try stdout.interface.writeAll("Shell encerrada.\n");
+    try stdout.interface.flush();
 }
