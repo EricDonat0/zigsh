@@ -1,6 +1,5 @@
 
 const std = @import("std");
-const posix = std.posix.system;
 
 // Estrutura definida pelo professor.
 // Sera utilizada nas proximas etapas.
@@ -41,7 +40,7 @@ const ParsedCommand = struct {
 };
 
 // Assinatura Juicy Main - Zig 0.16.x
-pub fn main(init: std.process.Init) !void {
+pub fn main(init: std.process.Init) !u8 {
     const allocator = init.gpa;
 
     // Configuracao da entrada padrao
@@ -87,6 +86,7 @@ pub fn main(init: std.process.Init) !void {
 
         // TODO 3: Parsing e tokenizacao completa
         var parsed = ParsedCommand.init(allocator);
+        defer parsed.deinit();
 
         var tokens = std.mem.tokenizeAny(u8, linha, " \t\r");
 
@@ -139,99 +139,116 @@ pub fn main(init: std.process.Init) !void {
         }
 
         // Ignorar comandos sem argumentos
-        if (parsed.args.items.len == 0) {
-            parsed.deinit();
-            continue;
-        }
+        if (parsed.args.items.len == 0) continue;
 
-        // TODO 4: Comandos internos
+        // TODO 4: Comandos internos (executar no processo pai)
         const comando = parsed.args.items[0];
 
-        if (std.mem.eql(u8, comando, "exit")) {
-            parsed.deinit();
-            break;
-        }
-
-        // TODO 5: Executar comandos externos
-
-        // Criar vetor de argumentos terminado em null
-        var argv_strings = try allocator.alloc(
-            [:0]u8,
-            parsed.args.items.len,
-        );
-
-        var args = try allocator.alloc(
-            ?[*:0]const u8,
-            parsed.args.items.len + 1,
-        );
-
-        for (parsed.args.items, 0..) |arg, i| {
-            argv_strings[i] = try allocator.dupeZ(u8, arg);
-            args[i] = argv_strings[i].ptr;
-        }
-
-        // Finalizar vetor de argumentos
-        args[parsed.args.items.len] = null;
-
-        // Criar processo filho
-        const pid = posix.fork();
-
-        if (std.posix.errno(pid) != .SUCCESS) {
-            std.debug.print("Erro no fork!\n", .{});
-
-            for (argv_strings) |arg| {
-                allocator.free(arg);
+        if (std.mem.eql(u8, comando, "cd")) {
+            if (parsed.args.items.len > 2) {
+                try stdout.interface.writeAll("Uso: cd [diretorio]\n");
+                try stdout.interface.flush();
+                continue;
             }
 
-            allocator.free(argv_strings);
-            allocator.free(args);
+            const destino = if (parsed.args.items.len == 2)
+                parsed.args.items[1]
+            else
+                init.environ_map.get("HOME") orelse {
+                    try stdout.interface.writeAll("cd: HOME nao definido\n");
+                    try stdout.interface.flush();
+                    continue;
+                };
 
-            parsed.deinit();
+            const dir = std.Io.Dir.cwd().openDir(init.io, destino, .{}) catch |err| {
+                try stdout.interface.print("cd: {s}: {s}\n", .{ destino, @errorName(err) });
+                try stdout.interface.flush();
+                continue;
+            };
+            defer dir.close(init.io);
+
+            std.process.setCurrentDir(init.io, dir) catch |err| {
+                try stdout.interface.print("cd: falha ao mudar diretorio: {s}\n", .{@errorName(err)});
+                try stdout.interface.flush();
+            };
             continue;
         }
 
-        if (pid == 0) {
-            // Processo filho
-            var caminho_buffer: [256]u8 = undefined;
-
-            const caminho = std.fmt.bufPrintSentinel(
-                &caminho_buffer,
-                "/bin/{s}",
-                .{comando},
-                0,
-            ) catch posix.exit(1);
-
-            const env = [_:null]?[*:0]const u8{};
-
-            _ = posix.execve(
-                caminho.ptr,
-                @ptrCast(args.ptr),
-                &env,
-            );
-
-            std.debug.print(
-                "Comando nao encontrado!\n",
-                .{},
-            );
-
-            posix.exit(127);
-        } else {
-            // TODO 8: Controle de concorrencia
-            // Temporariamente, aguardar o filho
-            var status: u32 = 0;
-            _ = posix.waitpid(@intCast(pid), &status, 0);
+        if (std.mem.eql(u8, comando, "pwd")) {
+            if (parsed.args.items.len != 1) {
+                try stdout.interface.writeAll("Uso: pwd\n");
+            } else {
+                try stdout.interface.print("{s}\n", .{cwd});
+            }
+            try stdout.interface.flush();
+            continue;
         }
 
-        // Liberar memoria dos argumentos
-        for (argv_strings) |arg| {
-            allocator.free(arg);
+        if (std.mem.eql(u8, comando, "help")) {
+            try stdout.interface.writeAll(
+                "Comandos internos:\n" ++
+                "  cd [diretorio] - muda o diretorio atual\n" ++
+                "  pwd            - mostra o diretorio atual\n" ++
+                "  help           - mostra esta ajuda\n" ++
+                "  exit [codigo]  - encerra o shell\n" ++
+                "Outros comandos sao executados pelo PATH.\n",
+            );
+            try stdout.interface.flush();
+            continue;
         }
 
-        allocator.free(argv_strings);
-        allocator.free(args);
+        if (std.mem.eql(u8, comando, "exit")) {
+            if (parsed.args.items.len > 2) {
+                try stdout.interface.writeAll("Uso: exit [codigo de 0 a 255]\n");
+                try stdout.interface.flush();
+                continue;
+            }
 
-        // Liberar memoria do comando
-        parsed.deinit();
+            const codigo: u8 = if (parsed.args.items.len == 2)
+                std.fmt.parseInt(u8, parsed.args.items[1], 10) catch {
+                    try stdout.interface.writeAll("exit: codigo deve estar entre 0 e 255\n");
+                    try stdout.interface.flush();
+                    continue;
+                }
+            else
+                0;
+
+            try stdout.interface.writeAll("Shell encerrada.\n");
+            try stdout.interface.flush();
+            return codigo;
+        }
+
+        // TODO 5: Comandos externos usando std.process.spawn (Zig 0.16)
+        // O sistema localiza o executavel a partir do PATH.
+        // A entrada e as saidas do filho sao herdadas do terminal.
+        try stdout.interface.flush();
+
+        var child = std.process.spawn(init.io, .{
+            .argv = parsed.args.items,
+            .environ_map = init.environ_map,
+            .stdin = .inherit,
+            .stdout = .inherit,
+            .stderr = .inherit,
+        }) catch |err| {
+            std.debug.print("Erro ao executar {s}: {s}\n", .{ comando, @errorName(err) });
+            continue;
+        };
+        defer child.kill(init.io);
+
+        // TODO 8: Temporariamente, aguardar o processo filho.
+        const resultado = child.wait(init.io) catch |err| {
+            std.debug.print("Erro ao aguardar {s}: {s}\n", .{ comando, @errorName(err) });
+            continue;
+        };
+
+        switch (resultado) {
+            .exited => |codigo| {
+                if (codigo != 0) {
+                    std.debug.print("Comando terminou com codigo {d}\n", .{codigo});
+                }
+            },
+            else => std.debug.print("Comando terminou de forma anormal\n", .{}),
+        }
 
         // TODO 6: Redirecionamento de arquivos
         // Implementar futuramente
@@ -242,4 +259,5 @@ pub fn main(init: std.process.Init) !void {
 
     try stdout.interface.writeAll("Shell encerrada.\n");
     try stdout.interface.flush();
+    return 0;
 }
