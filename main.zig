@@ -20,7 +20,23 @@ const ParsedCommand = struct {
     }
 
     pub fn deinit(self: *ParsedCommand) void {
+        for (self.args.items) |arg| {
+            self.allocator.free(arg);
+        }
+
         self.args.deinit(self.allocator);
+
+        if (self.stdin_file) |arquivo| {
+            self.allocator.free(arquivo);
+        }
+
+        if (self.stdout_file) |arquivo| {
+            self.allocator.free(arquivo);
+        }
+
+        if (self.stderr_file) |arquivo| {
+            self.allocator.free(arquivo);
+        }
     }
 };
 
@@ -70,43 +86,107 @@ pub fn main(init: std.process.Init) !void {
         }
 
         // TODO 3: Parsing e tokenizacao completa
-        // Temporariamente, manter o parser original
+        var parsed = ParsedCommand.init(allocator);
+
         var tokens = std.mem.tokenizeAny(u8, linha, " \t\r");
 
-        var args = [_]?[*:0]const u8{null} ** 9;
-        var arg_buffer: [8][256]u8 = undefined;
-        var quantidade: usize = 0;
+        while (tokens.next()) |token| {
 
-        while (tokens.next()) |texto| {
-            if (quantidade == 8) break;
+            // Redirecionamento de saida (stdout)
+            if (std.mem.eql(u8, token, ">")) {
+                if (tokens.next()) |arquivo| {
+                    parsed.stdout_file = try allocator.dupe(u8, arquivo);
+                }
+                continue;
+            }
 
-            const arg = std.fmt.bufPrintSentinel(
-                &arg_buffer[quantidade],
-                "{s}",
-                .{texto},
-                0,
-            ) catch break;
+            // Redirecionamento de erros (stderr)
+            if (std.mem.eql(u8, token, "2>")) {
+                if (tokens.next()) |arquivo| {
+                    parsed.stderr_file = try allocator.dupe(u8, arquivo);
+                }
+                continue;
+            }
 
-            args[quantidade] = arg.ptr;
-            quantidade += 1;
+            // Redirecionamento de entrada (stdin)
+            if (std.mem.eql(u8, token, "<")) {
+                if (tokens.next()) |arquivo| {
+                    parsed.stdin_file = try allocator.dupe(u8, arquivo);
+                }
+                continue;
+            }
+
+            // Execucao em segundo plano (background)
+            if (std.mem.eql(u8, token, "&")) {
+                parsed.is_background = true;
+                continue;
+            }
+
+            // Identificacao de pipeline
+            if (std.mem.eql(u8, token, "|")) {
+                try parsed.args.append(
+                    allocator,
+                    try allocator.dupe(u8, token),
+                );
+                continue;
+            }
+
+            // Armazenar argumentos normais
+            try parsed.args.append(
+                allocator,
+                try allocator.dupe(u8, token),
+            );
         }
 
-        if (quantidade == 0) continue;
-
-        const comando = std.mem.span(args[0].?);
+        // Ignorar comandos sem argumentos
+        if (parsed.args.items.len == 0) {
+            parsed.deinit();
+            continue;
+        }
 
         // TODO 4: Comandos internos
-        // Por enquanto, somente exit
+        const comando = parsed.args.items[0];
+
         if (std.mem.eql(u8, comando, "exit")) {
+            parsed.deinit();
             break;
         }
 
         // TODO 5: Executar comandos externos
-        // Temporariamente, usar fork + execve
+
+        // Criar vetor de argumentos terminado em null
+        var argv_strings = try allocator.alloc(
+            [:0]u8,
+            parsed.args.items.len,
+        );
+
+        var args = try allocator.alloc(
+            ?[*:0]const u8,
+            parsed.args.items.len + 1,
+        );
+
+        for (parsed.args.items, 0..) |arg, i| {
+            argv_strings[i] = try allocator.dupeZ(u8, arg);
+            args[i] = argv_strings[i].ptr;
+        }
+
+        // Finalizar vetor de argumentos
+        args[parsed.args.items.len] = null;
+
+        // Criar processo filho
         const pid = posix.fork();
 
         if (std.posix.errno(pid) != .SUCCESS) {
             std.debug.print("Erro no fork!\n", .{});
+
+            for (argv_strings) |arg| {
+                allocator.free(arg);
+            }
+
+            allocator.free(argv_strings);
+            allocator.free(args);
+
+            parsed.deinit();
             continue;
         }
 
@@ -125,7 +205,7 @@ pub fn main(init: std.process.Init) !void {
 
             _ = posix.execve(
                 caminho.ptr,
-                @ptrCast(&args),
+                @ptrCast(args.ptr),
                 &env,
             );
 
@@ -133,6 +213,7 @@ pub fn main(init: std.process.Init) !void {
                 "Comando nao encontrado!\n",
                 .{},
             );
+
             posix.exit(127);
         } else {
             // TODO 8: Controle de concorrencia
@@ -140,6 +221,17 @@ pub fn main(init: std.process.Init) !void {
             var status: u32 = 0;
             _ = posix.waitpid(@intCast(pid), &status, 0);
         }
+
+        // Liberar memoria dos argumentos
+        for (argv_strings) |arg| {
+            allocator.free(arg);
+        }
+
+        allocator.free(argv_strings);
+        allocator.free(args);
+
+        // Liberar memoria do comando
+        parsed.deinit();
 
         // TODO 6: Redirecionamento de arquivos
         // Implementar futuramente
