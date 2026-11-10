@@ -1,5 +1,61 @@
-
 const std = @import("std");
+const builtin = @import("builtin");
+
+test "parser rejeita sintaxe invalida sem vazar memoria" {
+    const casos = .{
+        .{ "echo teste > \"arquivo", error.AspasNaoFechadas },
+        .{ "cat < \"arquivo", error.AspasNaoFechadas },
+        .{ "ls 2> \"arquivo", error.AspasNaoFechadas },
+        .{ "echo & teste", error.BackgroundDeveSerFinal },
+        .{ "echo & &", error.BackgroundDeveSerFinal },
+        .{ "&", error.ComandoAusente },
+        .{ "echo >", error.ArquivoAusente },
+        .{ "echo > | cat", error.ArquivoInvalido },
+        .{ "cat < > saida", error.ArquivoInvalido },
+        .{ "echo > a > b", error.RedirecionamentoRepetido },
+        .{ "cat < a < b", error.RedirecionamentoRepetido },
+        .{ "ls 2> a 2> b", error.RedirecionamentoRepetido },
+    };
+    inline for (casos) |caso| {
+        var parsed = ParsedCommand.init(std.testing.allocator);
+        defer parsed.deinit();
+        var cortes: std.ArrayList(usize) = .empty;
+        defer cortes.deinit(std.testing.allocator);
+        var buffer: [4096]u8 = undefined;
+        try std.testing.expectError(caso[1], analisarLinha(std.testing.allocator, caso[0], &buffer, &parsed, &cortes));
+    }
+}
+
+test "parser preserva aspas e configura pipeline com redirecionamento e background" {
+    const allocator = std.testing.allocator;
+    var parsed = ParsedCommand.init(allocator);
+    defer parsed.deinit();
+    var cortes: std.ArrayList(usize) = .empty;
+    defer cortes.deinit(allocator);
+    var buffer: [4096]u8 = undefined;
+    try analisarLinha(allocator, "echo \"a b\" \"|\" | cat > \"saida com espacos\" &", &buffer, &parsed, &cortes);
+    var estagios = try separarEstagios(allocator, parsed.args.items, cortes.items);
+    defer estagios.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), estagios.items.len);
+    try std.testing.expectEqualStrings("a b", estagios.items[0][1]);
+    try std.testing.expectEqualStrings("|", estagios.items[0][2]);
+    try std.testing.expectEqualStrings("cat", estagios.items[1][0]);
+    try std.testing.expectEqualStrings("saida com espacos", parsed.stdout_file.?);
+    try std.testing.expect(parsed.is_background);
+}
+
+test "pipeline rejeita estagios vazios" {
+    for ([_][]const u8{ "ls |", "| wc", "ls | | wc" }) |linha| {
+        const allocator = std.testing.allocator;
+        var parsed = ParsedCommand.init(allocator);
+        defer parsed.deinit();
+        var cortes: std.ArrayList(usize) = .empty;
+        defer cortes.deinit(allocator);
+        var buffer: [4096]u8 = undefined;
+        try analisarLinha(allocator, linha, &buffer, &parsed, &cortes);
+        try std.testing.expectError(error.EstagioVazio, separarEstagios(allocator, parsed.args.items, cortes.items));
+    }
+}
 
 // Estrutura definida pelo professor.
 // Sera utilizada nas proximas etapas.
@@ -39,12 +95,457 @@ const ParsedCommand = struct {
     }
 };
 
+// TODO 7: um estagio do pipeline e o argv de um unico comando.
+// A linha "ls | grep zig | wc -l" gera tres estagios.
+const Estagio = []const []const u8;
+
+// TODO 8: processo disparado com "&" que ainda nao foi recolhido.
+const JobBackground = struct {
+    numero: usize,
+    pid: std.process.Child.Id,
+    nome: []const u8,
+};
+
+// TODO 3 (complemento): tokenizador com suporte a aspas.
+// "a b" vira um unico token (a b), sem as aspas. Um operador entre
+// aspas (ex.: "|" ou ">") e tratado como argumento comum.
+// O token e montado em `buffer`, que e reaproveitado a cada chamada,
+// por isso o parser precisa copiar (dupe) o token antes da proxima.
+const Tokenizador = struct {
+    linha: []const u8,
+    buffer: []u8,
+    pos: usize = 0,
+    // Indica se o ultimo token devolvido tinha aspas.
+    com_aspas: bool = false,
+
+    const Erro = error{ AspasNaoFechadas, TokenMuitoLongo };
+
+    fn ehEspaco(c: u8) bool {
+        return c == ' ' or c == '\t' or c == '\r';
+    }
+
+    fn proximo(self: *Tokenizador) Erro!?[]const u8 {
+        while (self.pos < self.linha.len and ehEspaco(self.linha[self.pos])) {
+            self.pos += 1;
+        }
+        if (self.pos >= self.linha.len) return null;
+
+        var tamanho: usize = 0;
+        var aspas: ?u8 = null;
+        self.com_aspas = false;
+
+        while (self.pos < self.linha.len) : (self.pos += 1) {
+            const c = self.linha[self.pos];
+
+            if (aspas) |abertura| {
+                if (c == abertura) {
+                    aspas = null;
+                    continue;
+                }
+            } else {
+                if (c == '"' or c == '\'') {
+                    aspas = c;
+                    self.com_aspas = true;
+                    continue;
+                }
+                if (ehEspaco(c)) break;
+            }
+
+            if (tamanho >= self.buffer.len) return error.TokenMuitoLongo;
+            self.buffer[tamanho] = c;
+            tamanho += 1;
+        }
+
+        if (aspas != null) return error.AspasNaoFechadas;
+        return self.buffer[0..tamanho];
+    }
+};
+
+// Operadores so sao especiais quando nao estao entre aspas.
+fn ehOperador(token: []const u8) bool {
+    for ([_][]const u8{ ">", "2>", "<", "|", "&" }) |operador| {
+        if (std.mem.eql(u8, token, operador)) return true;
+    }
+    return false;
+}
+
+// Em caso de erro, o chamador descarta toda a linha e libera parsed/cortes.
+fn analisarLinha(
+    allocator: std.mem.Allocator,
+    linha: []const u8,
+    buffer: []u8,
+    parsed: *ParsedCommand,
+    cortes: *std.ArrayList(usize),
+) !void {
+    var tokens = Tokenizador{ .linha = linha, .buffer = buffer };
+    while (try tokens.proximo()) |token| {
+        if (!tokens.com_aspas and ehOperador(token)) {
+            if (std.mem.eql(u8, token, "&")) {
+                if (parsed.args.items.len == 0) return error.ComandoAusente;
+                if (try tokens.proximo() != null) return error.BackgroundDeveSerFinal;
+                parsed.is_background = true;
+                break;
+            }
+            if (std.mem.eql(u8, token, "|")) {
+                try cortes.append(allocator, parsed.args.items.len);
+                continue;
+            }
+
+            // Escolher o campo antes de proximo(), que reutiliza o buffer.
+            const campo = if (std.mem.eql(u8, token, ">"))
+                &parsed.stdout_file
+            else if (std.mem.eql(u8, token, "2>"))
+                &parsed.stderr_file
+            else
+                &parsed.stdin_file;
+            // Esta shell minimalista rejeita redirecionamentos repetidos.
+            if (campo.* != null) return error.RedirecionamentoRepetido;
+            const arquivo = (try tokens.proximo()) orelse return error.ArquivoAusente;
+            if (arquivo.len == 0 or (!tokens.com_aspas and ehOperador(arquivo))) {
+                return error.ArquivoInvalido;
+            }
+            campo.* = try allocator.dupe(u8, arquivo);
+            continue;
+        }
+        const argumento = try allocator.dupe(u8, token);
+        errdefer allocator.free(argumento);
+        try parsed.args.append(allocator, argumento);
+    }
+    if (parsed.args.items.len == 0 and
+        (parsed.stdin_file != null or parsed.stdout_file != null or parsed.stderr_file != null))
+    {
+        return error.ComandoAusente;
+    }
+}
+
+// TODO 7: separa os argumentos nos estagios do pipeline.
+// `cortes` guarda, para cada "|" encontrado pelo parser, a posicao em
+// `args` onde o comando seguinte comeca. Retorna erro se algum estagio
+// ficar vazio (ex.: "ls |", "| wc" ou "ls | | wc").
+fn separarEstagios(
+    allocator: std.mem.Allocator,
+    args: []const []const u8,
+    cortes: []const usize,
+) error{ EstagioVazio, OutOfMemory }!std.ArrayList(Estagio) {
+    var estagios: std.ArrayList(Estagio) = .empty;
+    errdefer estagios.deinit(allocator);
+
+    var inicio: usize = 0;
+    for (cortes) |corte| {
+        if (corte == inicio) return error.EstagioVazio;
+        try estagios.append(allocator, args[inicio..corte]);
+        inicio = corte;
+    }
+
+    if (inicio == args.len) return error.EstagioVazio;
+    try estagios.append(allocator, args[inicio..]);
+
+    return estagios;
+}
+
+// TODO 8: resultado de um filho recolhido com waitpid.
+const FilhoTerminado = struct {
+    pid: std.process.Child.Id,
+    termino: std.process.Child.Term,
+};
+
+// TODO 8: recolhe, sem bloquear, UM filho qualquer que ja tenha terminado.
+// Retorna null se nenhum filho terminou (ou se nao ha filhos).
+// Usa waitpid(-1, WNOHANG) diretamente porque Child.wait() e bloqueante
+// e porque o fork cujo exec falhou (comando inexistente) nao tem o pid
+// devolvido pelo spawn(): so assim ele tambem e recolhido.
+fn recolherQualquerFilho() ?FilhoTerminado {
+    const posix = std.posix;
+
+    var status: if (builtin.link_libc) c_int else u32 = undefined;
+
+    while (true) {
+        const rc = posix.system.waitpid(-1, &status, posix.W.NOHANG);
+
+        switch (posix.errno(rc)) {
+            .SUCCESS => {
+                // waitpid devolve 0 quando nenhum filho terminou ainda.
+                if (rc == 0) return null;
+
+                const pid: std.process.Child.Id = @intCast(rc);
+                const s: u32 = @bitCast(status);
+
+                const termino: std.process.Child.Term = if (posix.W.IFEXITED(s))
+                    .{ .exited = posix.W.EXITSTATUS(s) }
+                else if (posix.W.IFSIGNALED(s))
+                    .{ .signal = posix.W.TERMSIG(s) }
+                else
+                    .{ .unknown = s };
+
+                return .{ .pid = pid, .termino = termino };
+            },
+            .INTR => continue,
+            // ECHILD: nao ha mais filhos para recolher.
+            else => return null,
+        }
+    }
+}
+
+// TODO 8: recolhe os processos em segundo plano que ja terminaram,
+// evitando zumbis sem bloquear o REPL. Chamado antes de cada prompt,
+// quando nao ha nenhum processo em primeiro plano pendente.
+fn recolherBackground(
+    allocator: std.mem.Allocator,
+    jobs: *std.ArrayList(JobBackground),
+    stdout: *std.Io.Writer,
+) !void {
+    while (recolherQualquerFilho()) |filho| {
+        // Procurar o job correspondente. Um pid desconhecido e o fork
+        // de um spawn que falhou: basta te-lo recolhido.
+        const indice = for (jobs.items, 0..) |job, i| {
+            if (job.pid == filho.pid) break i;
+        } else continue;
+
+        const job = jobs.items[indice];
+
+        switch (filho.termino) {
+            .exited => |codigo| try stdout.print(
+                "[{d}] Concluido (pid {d}): {s} (codigo {d})\n",
+                .{ job.numero, job.pid, job.nome, codigo },
+            ),
+            .signal => |sinal| try stdout.print(
+                "[{d}] Encerrado por sinal {s} (pid {d}): {s}\n",
+                .{ job.numero, @tagName(sinal), job.pid, job.nome },
+            ),
+            else => try stdout.print(
+                "[{d}] Concluido (pid {d}): {s}\n",
+                .{ job.numero, job.pid, job.nome },
+            ),
+        }
+
+        allocator.free(job.nome);
+        _ = jobs.orderedRemove(indice);
+    }
+
+    try stdout.flush();
+}
+
+// TODO 5, 6, 7 e 8: executa um comando externo ou um pipeline.
+//
+// Redirecionamentos (TODO 6): os arquivos sao abertos pelo shell e
+// passados ao processo filho como `.file`, assim o proprio sistema
+// operacional faz a transferencia de dados (sem o shell copiar bytes,
+// o que tambem evita travamentos com & e com pipelines).
+//   - "<"  vale para o primeiro estagio do pipeline.
+//   - ">" e "2>" valem para o ultimo estagio.
+//
+// Pipeline (TODO 7): cada estagio, exceto o ultimo, e criado com
+// stdout = .pipe; a ponta de leitura desse pipe vira o stdin (.file)
+// do estagio seguinte. O shell fecha a ponta assim que o filho a herda,
+// para que o processo seguinte receba EOF quando o anterior terminar.
+//
+// Concorrencia (TODO 8): em primeiro plano aguarda todos os filhos;
+// com "&" registra os pids em `jobs` e devolve o prompt imediatamente.
+fn executarPipeline(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    environ_map: *const std.process.Environ.Map,
+    parsed: *const ParsedCommand,
+    estagios: []const Estagio,
+    jobs: *std.ArrayList(JobBackground),
+    proximo_job: *usize,
+    stdout: *std.Io.Writer,
+) !void {
+    const diretorio = std.Io.Dir.cwd();
+
+    // Tudo que o shell escreveu precisa sair antes de criar os filhos,
+    // porque eles herdam o mesmo terminal.
+    try stdout.flush();
+
+    // TODO 6: abrir os arquivos de redirecionamento antes de criar
+    // qualquer processo. Se algum falhar, nada e executado.
+    var arquivo_entrada: ?std.Io.File = null;
+    defer if (arquivo_entrada) |arquivo| arquivo.close(io);
+
+    if (parsed.stdin_file) |nome| {
+        arquivo_entrada = diretorio.openFile(io, nome, .{}) catch |err| {
+            std.debug.print(
+                "Erro ao abrir arquivo de entrada '{s}': {s}\n",
+                .{ nome, @errorName(err) },
+            );
+            return;
+        };
+    }
+
+    var arquivo_saida: ?std.Io.File = null;
+    defer if (arquivo_saida) |arquivo| arquivo.close(io);
+
+    if (parsed.stdout_file) |nome| {
+        arquivo_saida = diretorio.createFile(io, nome, .{}) catch |err| {
+            std.debug.print(
+                "Erro ao criar arquivo de saida '{s}': {s}\n",
+                .{ nome, @errorName(err) },
+            );
+            return;
+        };
+    }
+
+    var arquivo_erros: ?std.Io.File = null;
+    defer if (arquivo_erros) |arquivo| arquivo.close(io);
+
+    if (parsed.stderr_file) |nome| {
+        arquivo_erros = diretorio.createFile(io, nome, .{}) catch |err| {
+            std.debug.print(
+                "Erro ao criar arquivo de erros '{s}': {s}\n",
+                .{ nome, @errorName(err) },
+            );
+            return;
+        };
+    }
+
+    // TODO 5 e 7: criar os processos, ligando a saida de um a entrada
+    // do seguinte.
+    var filhos: std.ArrayList(std.process.Child) = .empty;
+    defer filhos.deinit(allocator);
+    // Reservar antes do spawn evita perder um filho por falha de alocacao.
+    try filhos.ensureTotalCapacity(allocator, estagios.len);
+    errdefer for (filhos.items) |*filho| filho.kill(io);
+
+    // Ponta de leitura do pipe do estagio anterior (ainda nao entregue).
+    var entrada_anterior: ?std.Io.File = null;
+    defer if (entrada_anterior) |pipe| pipe.close(io);
+
+    for (estagios, 0..) |argv, i| {
+        const primeiro = i == 0;
+        const ultimo = i == estagios.len - 1;
+
+        const stdin_cfg: std.process.SpawnOptions.StdIo = if (entrada_anterior) |pipe|
+            .{ .file = pipe }
+        else if (primeiro and arquivo_entrada != null)
+            .{ .file = arquivo_entrada.? }
+        else
+            .inherit;
+
+        const stdout_cfg: std.process.SpawnOptions.StdIo = if (!ultimo)
+            .pipe
+        else if (arquivo_saida) |arquivo|
+            .{ .file = arquivo }
+        else
+            .inherit;
+
+        const stderr_cfg: std.process.SpawnOptions.StdIo = if (ultimo and arquivo_erros != null)
+            .{ .file = arquivo_erros.? }
+        else
+            .inherit;
+
+        var filho = std.process.spawn(io, .{
+            .argv = argv,
+            .environ_map = environ_map,
+            .stdin = stdin_cfg,
+            .stdout = stdout_cfg,
+            .stderr = stderr_cfg,
+        }) catch |err| {
+            std.debug.print(
+                "Erro ao executar {s}: {s}\n",
+                .{ argv[0], @errorName(err) },
+            );
+
+            // Fechar a ponta pendente para que o estagio anterior receba
+            // SIGPIPE ao escrever. Encerrar tambem filhos que nao escrevem.
+            if (entrada_anterior) |pipe| {
+                pipe.close(io);
+                entrada_anterior = null;
+            }
+            for (filhos.items) |*criado| {
+                criado.kill(io);
+            }
+            return;
+        };
+
+        // O filho ja herdou a ponta de leitura: o shell nao precisa
+        // mais dela. Fechar aqui e essencial, senao o proximo processo
+        // nunca receberia EOF.
+        if (entrada_anterior) |pipe| {
+            pipe.close(io);
+            entrada_anterior = null;
+        }
+
+        // Guardar a ponta de leitura deste estagio para o proximo.
+        // Zeramos o campo para o wait() nao fechar o descritor de novo.
+        if (filho.stdout) |pipe| {
+            entrada_anterior = pipe;
+            filho.stdout = null;
+        }
+
+        filhos.appendAssumeCapacity(filho);
+    }
+
+    // TODO 8: Controle de Concorrencia
+    if (parsed.is_background) {
+        const inicio_jobs = jobs.items.len;
+        errdefer {
+            for (jobs.items[inicio_jobs..]) |job| allocator.free(job.nome);
+            jobs.shrinkRetainingCapacity(inicio_jobs);
+        }
+        try jobs.ensureUnusedCapacity(allocator, filhos.items.len);
+        for (filhos.items, estagios) |filho, argv| {
+            const nome = try allocator.dupe(u8, argv[0]);
+            jobs.appendAssumeCapacity(.{
+                .numero = proximo_job.*,
+                .pid = filho.id.?,
+                .nome = nome,
+            });
+            proximo_job.* += 1;
+        }
+        for (jobs.items[inicio_jobs..]) |job| {
+            try stdout.print(
+                "[{d}] Processo '{s}' (pid {d}) executado em segundo plano.\n",
+                .{ job.numero, job.nome, job.pid },
+            );
+        }
+        try stdout.flush();
+        return;
+    }
+
+    for (filhos.items, estagios) |*filho, argv| {
+        const resultado = filho.wait(io) catch |err| {
+            std.debug.print(
+                "Erro ao aguardar {s}: {s}\n",
+                .{ argv[0], @errorName(err) },
+            );
+            continue;
+        };
+
+        switch (resultado) {
+            .exited => |codigo| {
+                if (codigo != 0) {
+                    std.debug.print(
+                        "Comando '{s}' terminou com codigo {d}\n",
+                        .{ argv[0], codigo },
+                    );
+                }
+            },
+            .signal => |sinal| {
+                // SIGPIPE e normal em pipelines: o leitor fechou antes
+                // do escritor terminar (ex.: "seq 1 100000 | head -1").
+                if (sinal != .PIPE) {
+                    std.debug.print(
+                        "Comando '{s}' encerrado pelo sinal {s}\n",
+                        .{ argv[0], @tagName(sinal) },
+                    );
+                }
+            },
+            else => {
+                std.debug.print(
+                    "Comando '{s}' terminou de forma anormal\n",
+                    .{argv[0]},
+                );
+            },
+        }
+    }
+}
+
 // Assinatura Juicy Main - Zig 0.16.x
 pub fn main(init: std.process.Init) !u8 {
     const allocator = init.gpa;
 
     // Configuracao da entrada padrao
-    var input_buffer: [256]u8 = undefined;
+    var input_buffer: [4096]u8 = undefined;
     var stdin = std.Io.File.stdin().reader(
         init.io,
         &input_buffer,
@@ -57,7 +558,21 @@ pub fn main(init: std.process.Init) !u8 {
         &output_buffer,
     );
 
+    // Buffer de montagem de tokens (mesmo tamanho da linha).
+    var token_buffer: [4096]u8 = undefined;
+
+    // TODO 8: processos em segundo plano ainda em execucao.
+    var jobs: std.ArrayList(JobBackground) = .empty;
+    var proximo_job: usize = 1;
+    defer {
+        for (jobs.items) |job| allocator.free(job.nome);
+        jobs.deinit(allocator);
+    }
+
     while (true) {
+
+        // TODO 8: recolher processos em segundo plano concluidos
+        try recolherBackground(allocator, &jobs, &stdout.interface);
 
         // TODO 1: Prompt dinamico com diretorio atual
         const cwd = try std.process.currentPathAlloc(
@@ -79,6 +594,8 @@ pub fn main(init: std.process.Init) !u8 {
             break;
         };
 
+        try recolherBackground(allocator, &jobs, &stdout.interface);
+
         // Ignorar linhas vazias ou apenas com espacos
         if (std.mem.trim(u8, linha, " \t\r").len == 0) {
             continue;
@@ -88,81 +605,55 @@ pub fn main(init: std.process.Init) !u8 {
         var parsed = ParsedCommand.init(allocator);
         defer parsed.deinit();
 
-        var tokens = std.mem.tokenizeAny(u8, linha, " \t\r");
+        // TODO 7: posicoes em parsed.args onde cada "|" corta o pipeline.
+        var cortes: std.ArrayList(usize) = .empty;
+        defer cortes.deinit(allocator);
 
-        while (tokens.next()) |token| {
-
-            // Redirecionamento de saida (stdout)
-            if (std.mem.eql(u8, token, ">")) {
-                if (tokens.next()) |arquivo| {
-                    parsed.stdout_file = try allocator.dupe(u8, arquivo);
-                } else {
-                    try stdout.interface.writeAll(
-                        "Erro: arquivo de saida nao informado\n",
-                    );
-                    try stdout.interface.flush();
-                    continue;
-                }
-                continue;
-            }
-
-            // Redirecionamento de erros (stderr)
-            if (std.mem.eql(u8, token, "2>")) {
-                if (tokens.next()) |arquivo| {
-                    parsed.stderr_file = try allocator.dupe(u8, arquivo);
-                } else {
-                    try stdout.interface.writeAll(
-                        "Erro: arquivo de erros nao informado\n",
-                    );
-                    try stdout.interface.flush();
-                    continue;
-                }
-                continue;
-            }
-
-            // Redirecionamento de entrada (stdin)
-            if (std.mem.eql(u8, token, "<")) {
-                if (tokens.next()) |arquivo| {
-                    parsed.stdin_file = try allocator.dupe(u8, arquivo);
-                } else {
-                    try stdout.interface.writeAll(
-                        "Erro: arquivo de entrada nao informado\n",
-                    );
-                    try stdout.interface.flush();
-                    continue;
-                }
-                continue;
-            }
-
-            // Execucao em segundo plano (background)
-            if (std.mem.eql(u8, token, "&")) {
-                parsed.is_background = true;
-                continue;
-            }
-
-            // Identificacao de pipeline
-            if (std.mem.eql(u8, token, "|")) {
-                try parsed.args.append(
-                    allocator,
-                    try allocator.dupe(u8, token),
-                );
-                continue;
-            }
-
-            // Armazenar argumentos normais
-            try parsed.args.append(
-                allocator,
-                try allocator.dupe(u8, token),
-            );
-        }
+        analisarLinha(allocator, linha, &token_buffer, &parsed, &cortes) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            const mensagem = switch (err) {
+                error.AspasNaoFechadas => "aspas nao fechadas",
+                error.TokenMuitoLongo => "argumento muito longo",
+                error.BackgroundDeveSerFinal => "& deve aparecer somente no final",
+                error.ComandoAusente => "comando nao informado",
+                error.ArquivoAusente => "arquivo de redirecionamento nao informado",
+                error.ArquivoInvalido => "nome de arquivo invalido no redirecionamento",
+                error.RedirecionamentoRepetido => "redirecionamento repetido",
+                else => @errorName(err),
+            };
+            try stdout.interface.print("Erro de sintaxe: {s}\n", .{mensagem});
+            try stdout.interface.flush();
+            continue;
+        };
 
         // Ignorar comandos sem argumentos
-        if (parsed.args.items.len == 0) continue;
+        if (parsed.args.items.len == 0 and cortes.items.len == 0) continue;
+
+        // TODO 7: montar os estagios do pipeline
+        var estagios = separarEstagios(
+            allocator,
+            parsed.args.items,
+            cortes.items,
+        ) catch |err| switch (err) {
+            error.EstagioVazio => {
+                try stdout.interface.writeAll(
+                    "Erro de sintaxe: pipeline com comando vazio " ++
+                        "(ex.: 'ls |', '| wc' ou 'ls | | wc')\n",
+                );
+                try stdout.interface.flush();
+                continue;
+            },
+            error.OutOfMemory => return err,
+        };
+        defer estagios.deinit(allocator);
+
+        const eh_pipeline = estagios.items.len > 1;
 
         // TODO 4: Comandos internos (executar no processo pai)
+        // Em um pipeline nao ha comandos internos: tudo vira processo filho.
         const comando = parsed.args.items[0];
 
-        if (std.mem.eql(u8, comando, "cd")) {
+        if (!eh_pipeline and std.mem.eql(u8, comando, "cd")) {
             if (parsed.args.items.len > 2) {
                 try stdout.interface.writeAll("Uso: cd [diretorio]\n");
                 try stdout.interface.flush();
@@ -204,7 +695,7 @@ pub fn main(init: std.process.Init) !u8 {
             continue;
         }
 
-        if (std.mem.eql(u8, comando, "pwd")) {
+        if (!eh_pipeline and std.mem.eql(u8, comando, "pwd")) {
             if (parsed.args.items.len != 1) {
                 try stdout.interface.writeAll("Uso: pwd\n");
             } else {
@@ -214,20 +705,39 @@ pub fn main(init: std.process.Init) !u8 {
             continue;
         }
 
-        if (std.mem.eql(u8, comando, "help")) {
+        if (!eh_pipeline and std.mem.eql(u8, comando, "help")) {
             try stdout.interface.writeAll(
                 "Comandos internos:\n" ++
-                "  cd [diretorio] - muda o diretorio atual\n" ++
-                "  pwd            - mostra o diretorio atual\n" ++
-                "  help           - mostra esta ajuda\n" ++
-                "  exit [codigo]  - encerra o shell\n" ++
-                "Outros comandos sao executados pelo PATH.\n",
+                    "  cd [diretorio] - muda o diretorio atual\n" ++
+                    "  pwd            - mostra o diretorio atual\n" ++
+                    "  jobs           - lista processos em segundo plano\n" ++
+                    "  help           - mostra esta ajuda\n" ++
+                    "  exit [codigo]  - encerra o shell\n" ++
+                    "Outros comandos sao executados pelo PATH.\n" ++
+                    "Operadores: > 2> < (redirecionamento), | (pipeline), & (segundo plano)\n",
             );
             try stdout.interface.flush();
             continue;
         }
 
-        if (std.mem.eql(u8, comando, "exit")) {
+        // TODO 8: lista os processos em segundo plano ainda em execucao
+        if (!eh_pipeline and std.mem.eql(u8, comando, "jobs")) {
+            if (jobs.items.len == 0) {
+                try stdout.interface.writeAll(
+                    "Nenhum processo em segundo plano.\n",
+                );
+            }
+            for (jobs.items) |job| {
+                try stdout.interface.print(
+                    "[{d}] Em execucao (pid {d}): {s}\n",
+                    .{ job.numero, job.pid, job.nome },
+                );
+            }
+            try stdout.interface.flush();
+            continue;
+        }
+
+        if (!eh_pipeline and std.mem.eql(u8, comando, "exit")) {
             if (parsed.args.items.len > 2) {
                 try stdout.interface.writeAll(
                     "Uso: exit [codigo de 0 a 255]\n",
@@ -247,225 +757,37 @@ pub fn main(init: std.process.Init) !u8 {
             else
                 0;
 
+            if (jobs.items.len > 0) {
+                try stdout.interface.print(
+                    "Aviso: {d} processo(s) em segundo plano ainda em execucao.\n",
+                    .{jobs.items.len},
+                );
+            }
             try stdout.interface.writeAll("Shell encerrada.\n");
             try stdout.interface.flush();
             return codigo;
         }
 
-        // TODO 5: Comandos externos usando std.process.spawn (Zig 0.16)
-        // Os canais sao configurados como pipe quando existe redirecionamento.
-        // Sem redirecionamento, o processo herda os canais do terminal.
-        try stdout.interface.flush();
-
-        var child = std.process.spawn(init.io, .{
-            .argv = parsed.args.items,
-            .environ_map = init.environ_map,
-
-            .stdin = if (parsed.stdin_file != null)
-                .pipe
-            else
-                .inherit,
-
-            .stdout = if (parsed.stdout_file != null)
-                .pipe
-            else
-                .inherit,
-
-            .stderr = if (parsed.stderr_file != null)
-                .pipe
-            else
-                .inherit,
-        }) catch |err| {
-            std.debug.print(
-                "Erro ao executar {s}: {s}\n",
-                .{ comando, @errorName(err) },
-            );
-            continue;
-        };
-
-        // TODO 6: Redirecionamento de arquivos
-        const diretorio = std.Io.Dir.cwd();
-
-        // Redirecionamento de entrada (stdin)
-        if (parsed.stdin_file) |nome| {
-            var arquivo_entrada = diretorio.openFile(
-                init.io,
-                nome,
-                .{},
-            ) catch |err| {
-                std.debug.print(
-                    "Erro ao abrir arquivo de entrada '{s}': {s}\n",
-                    .{ nome, @errorName(err) },
-                );
-
-                child.kill(init.io);
-                continue;
-            };
-            defer arquivo_entrada.close(init.io);
-
-            var buffer_entrada: [1024]u8 = undefined;
-
-            while (true) {
-                const quantidade = arquivo_entrada.readStreaming(
-                    init.io,
-                    &.{buffer_entrada[0..]},
-                ) catch |err| {
-                    if (err == error.EndOfStream) {
-                        break;
-                    }
-
-                    std.debug.print(
-                        "Erro ao ler arquivo '{s}': {s}\n",
-                        .{ nome, @errorName(err) },
-                    );
-                    break;
-                };
-
-                if (quantidade == 0) break;
-
-                child.stdin.?.writeStreamingAll(
-                    init.io,
-                    buffer_entrada[0..quantidade],
-                ) catch |err| {
-                    std.debug.print(
-                        "Erro ao enviar entrada para o processo: {s}\n",
-                        .{@errorName(err)},
-                    );
-                    break;
-                };
-            }
-
-            // Fechar o pipe para informar EOF ao processo filho.
-            child.stdin.?.close(init.io);
-            child.stdin = null;
-        }
-
-        // Redirecionamento de saida (stdout)
-        if (parsed.stdout_file) |nome| {
-            var arquivo_saida = diretorio.createFile(
-                init.io,
-                nome,
-                .{},
-            ) catch |err| {
-                std.debug.print(
-                    "Erro ao criar arquivo de saida '{s}': {s}\n",
-                    .{ nome, @errorName(err) },
-                );
-
-                child.kill(init.io);
-                continue;
-            };
-            defer arquivo_saida.close(init.io);
-
-            var buffer_saida: [1024]u8 = undefined;
-
-            while (true) {
-                const quantidade = child.stdout.?.readStreaming(
-                    init.io,
-                    &.{buffer_saida[0..]},
-                ) catch |err| {
-                    if (err == error.EndOfStream) {
-                        break;
-                    }
-
-                    std.debug.print(
-                        "Erro ao ler saida do processo: {s}\n",
-                        .{@errorName(err)},
-                    );
-                    break;
-                };
-
-                if (quantidade == 0) break;
-
-                try arquivo_saida.writeStreamingAll(
-                    init.io,
-                    buffer_saida[0..quantidade],
-                );
-            }
-        }
-
-        // Redirecionamento de erros (stderr)
-        if (parsed.stderr_file) |nome| {
-            var arquivo_erros = diretorio.createFile(
-                init.io,
-                nome,
-                .{},
-            ) catch |err| {
-                std.debug.print(
-                    "Erro ao criar arquivo de erros '{s}': {s}\n",
-                    .{ nome, @errorName(err) },
-                );
-
-                child.kill(init.io);
-                continue;
-            };
-            defer arquivo_erros.close(init.io);
-
-            var buffer_erros: [1024]u8 = undefined;
-
-            while (true) {
-                const quantidade = child.stderr.?.readStreaming(
-                    init.io,
-                    &.{buffer_erros[0..]},
-                ) catch |err| {
-                    if (err == error.EndOfStream) {
-                        break;
-                    }
-
-                    std.debug.print(
-                        "Erro ao ler erros do processo: {s}\n",
-                        .{@errorName(err)},
-                    );
-                    break;
-                };
-
-                if (quantidade == 0) break;
-
-                try arquivo_erros.writeStreamingAll(
-                    init.io,
-                    buffer_erros[0..quantidade],
-                );
-            }
-        }
-
-        // TODO 7: Implementar o encadeamento I/O entre processos conectados por Pipeline (|)
-        // Conectar o stdout.Pipe do processo 1 ao stdin.Pipe do processo 2.
-
-        // TODO 8: Controle de Concorrencia
-        if (parsed.is_background) {
-            try stdout.interface.print(
-                "Processo '{s}' executado em segundo plano.\n",
-                .{comando},
-            );
-            try stdout.interface.flush();
-        } else {
-            const resultado = child.wait(init.io) catch |err| {
-                std.debug.print(
-                    "Erro ao aguardar {s}: {s}\n",
-                    .{ comando, @errorName(err) },
-                );
-                continue;
-            };
-
-            switch (resultado) {
-                .exited => |codigo| {
-                    if (codigo != 0) {
-                        std.debug.print(
-                            "Comando terminou com codigo {d}\n",
-                            .{codigo},
-                        );
-                    }
-                },
-                else => {
-                    std.debug.print(
-                        "Comando terminou de forma anormal\n",
-                        .{},
-                    );
-                },
-            }
-        }
+        // TODO 5, 6, 7 e 8: Comandos externos, redirecionamento,
+        // pipeline e controle de concorrencia
+        try executarPipeline(
+            init.io,
+            allocator,
+            init.environ_map,
+            &parsed,
+            estagios.items,
+            &jobs,
+            &proximo_job,
+            &stdout.interface,
+        );
     }
 
+    if (jobs.items.len > 0) {
+        try stdout.interface.print(
+            "Aviso: {d} processo(s) em segundo plano ainda em execucao.\n",
+            .{jobs.items.len},
+        );
+    }
     try stdout.interface.writeAll("Shell encerrada.\n");
     try stdout.interface.flush();
 
